@@ -10,6 +10,7 @@ import os
 import re
 import torch
 import math
+import random
 import shutil
 import gradio as gr
 
@@ -45,6 +46,52 @@ def download_model():
 
 def safe_str(x):
     return re.sub(r' +', r' ', x).strip(",. \r\n")
+
+
+def get_expansion_seed(seed_input, generation_seed):
+    """Handle seed logic for expansion"""
+    if seed_input == -1:
+        # Generate random seed
+        return random.randint(0, SEED_LIMIT_NUMPY - 1)
+    elif seed_input == 0:
+        # Use generation seed
+        return generation_seed if generation_seed is not None else random.randint(0, SEED_LIMIT_NUMPY - 1)
+    else:
+        # Use provided seed
+        return seed_input
+
+
+def extract_added_tags(original, expanded):
+    """Extract only the new tags that were added by expansion"""
+    if not expanded or expanded == original:
+        return ""
+    
+    # Find the last comma in original to use as anchor point
+    last_comma_pos = original.rfind(',')
+    
+    if last_comma_pos != -1:
+        # Get the text from last comma onwards in original
+        anchor_text = original[last_comma_pos:]
+        
+        # Find this anchor in the expanded text (from the end)
+        anchor_pos = expanded.rfind(anchor_text)
+        
+        if anchor_pos != -1:
+            # Get everything after the anchor
+            added_content = expanded[anchor_pos + len(anchor_text):].strip()
+            if added_content.startswith(','):
+                added_content = added_content[1:].strip()
+            return added_content
+    
+    # Fallback: if expanded starts with original, extract the difference
+    if expanded.startswith(original):
+        added_content = expanded[len(original):].strip()
+        if added_content.startswith(','):
+            added_content = added_content[1:].strip()
+        return added_content
+    
+    # Last resort: return entire expanded as "added"
+    return expanded
 
 
 class FooocusExpansion:
@@ -131,10 +178,46 @@ class FooocusExpansion:
 def create_positive(positive, seed):
     if not positive:
         return ''
-    expansion = FooocusExpansion()
-    positive = expansion(positive, seed=seed)
-    expansion.unload_model()  # Unload the model after use
-    return positive
+    try:
+        expansion = FooocusExpansion()
+        positive = expansion(positive, seed=seed)
+        expansion.unload_model()  # Unload the model after use
+        return positive
+    except Exception as e:
+        print(f"❌ Fooocus Expansion Error in create_positive: {e}")
+        return positive  # Return original prompt if error
+
+
+def create_positive_with_weight(positive, seed, weight):
+    """Create expansion with weight control"""
+    if not positive:
+        return ''
+    
+    try:
+        # Get the expanded result from Fooocus
+        expanded = create_positive(positive, seed)
+        
+        # If no expansion happened, return original
+        if expanded == positive or not expanded:
+            return positive
+        
+        # If weight is 1.0, return Fooocus result directly (no weight needed)
+        if weight == 1.0:
+            return expanded
+        
+        # For weights != 1.0, extract only the new tags and apply weight to them
+        added_tags = extract_added_tags(positive, expanded)
+        
+        if added_tags:
+            # Return: original + (new_tags:weight)
+            return f"{positive}, ({added_tags}:{weight:.2f})"
+        else:
+            # No new tags found, return original
+            return positive
+        
+    except Exception as e:
+        print(f"❌ Fooocus Expansion Error in create_positive_with_weight: {e}")
+        return positive  # Return original prompt if error
 
 
 class FooocusPromptExpansion(scripts.Script):
@@ -156,7 +239,8 @@ class FooocusPromptExpansion(scripts.Script):
 
     def ui(self, is_img2img):
         with InputAccordion(False, label="Fooocus Expansion") as is_enabled:
-            seed = gr.Number(value=0, label="Seed", info="Seed for random number generator")
+            seed = gr.Number(value=-1, label="Expansion Seed", info="Seed for expansion: -1=random, 0=use generation seed, other=fixed seed")
+            weight = gr.Number(value=1.0, label="Expansion Weight", info="Weight for expansion tags: 1.0=no weight, 0.75=(expansion:0.75)")
             if self.prompt_elm is not None:
                 with gr.Row():
                     generate = gr.Button('Generate expansion prompts')
@@ -167,25 +251,78 @@ class FooocusPromptExpansion(scripts.Script):
                     x.save_to_config = False
 
                 generate.click(
-                    fn=create_positive,
-                    inputs=[self.prompt_elm, seed],
+                    fn=lambda prompt, seed_input, weight_val: self.safe_generate_preview(prompt, seed_input, weight_val),
+                    inputs=[self.prompt_elm, seed, weight],
                     outputs=[preview],
                 )
                 apply.click(
-                    fn=lambda *args: (False, create_positive(*args)),
-                    inputs=[self.prompt_elm, seed],
+                    fn=lambda prompt, seed_input, weight_val: self.safe_apply_expansion(prompt, seed_input, weight_val),
+                    inputs=[self.prompt_elm, seed, weight],
                     outputs=[is_enabled, self.prompt_elm],
                 )
         self.infotext_fields.append((is_enabled, lambda d: False))
 
-        return [is_enabled, seed]
+        return [is_enabled, seed, weight]
 
-    def process(self, p, is_enabled, seed):
+    def safe_generate_preview(self, prompt, seed_input, weight_val):
+        """Safely generate preview with error handling"""
+        try:
+            expansion_seed = get_expansion_seed(seed_input, None)
+            return create_positive_with_weight(prompt, expansion_seed, weight_val)
+        except Exception as e:
+            print(f"❌ Fooocus Expansion Preview Error: {e}")
+            return f"Error generating preview: {str(e)}"
+
+    def safe_apply_expansion(self, prompt, seed_input, weight_val):
+        """Safely apply expansion with error handling"""
+        try:
+            expansion_seed = get_expansion_seed(seed_input, None)
+            expanded = create_positive_with_weight(prompt, expansion_seed, weight_val)
+            return (False, expanded)
+        except Exception as e:
+            print(f"❌ Fooocus Expansion Apply Error: {e}")
+            return (False, prompt)  # Return original prompt if error
+
+    def process(self, p, is_enabled, seed_input, weight):
         if not is_enabled:
             return
 
         for i, prompt in enumerate(p.all_prompts):
-            p.all_prompts[i] = create_positive(prompt, seed)
+            try:
+                # Get the appropriate seed for this prompt
+                if seed_input == -1:
+                    # Generate random seed
+                    expansion_seed = random.randint(0, SEED_LIMIT_NUMPY - 1)
+                elif seed_input == 0:
+                    # Use generation seed
+                    generation_seed = getattr(p, 'seed', None)
+                    if generation_seed is None:
+                        generation_seed = random.randint(0, SEED_LIMIT_NUMPY - 1)
+                    expansion_seed = generation_seed
+                else:
+                    # Use provided seed
+                    expansion_seed = int(seed_input)
+                
+                # Get the expansion and apply weight
+                expanded_prompt = create_positive_with_weight(prompt, expansion_seed, weight)
+                
+                # For logging, get the raw expansion and extract added tags
+                raw_expansion = create_positive(prompt, expansion_seed)
+                added_tags = extract_added_tags(prompt, raw_expansion)
+                
+                if added_tags:
+                    if weight == 1.0:
+                        print(f"✨ Fooocus Expansion added: {added_tags}")
+                    else:
+                        print(f"⚖️ Fooocus Expansion added (weight {weight}): {added_tags}")
+                
+                p.all_prompts[i] = expanded_prompt
+                
+            except Exception as e:
+                print(f"❌ Fooocus Expansion Error processing prompt {i}: {e}")
+                print(f"🔧 Keeping original prompt unchanged: {prompt}")
+                # Keep original prompt unchanged if any error occurs
+                continue
 
     def save_prompt_box(self, on_component):
         self.prompt_elm = on_component.component
