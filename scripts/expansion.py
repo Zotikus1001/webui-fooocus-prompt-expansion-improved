@@ -174,7 +174,7 @@ class FooocusExpansion:
         return result
 
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=128)
 def create_positive(positive, seed):
     if not positive:
         return ''
